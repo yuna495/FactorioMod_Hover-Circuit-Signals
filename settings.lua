@@ -10,7 +10,7 @@ data:extend({
     type = "int-setting",
     name = "hover-circuit-signals-offset-x",
     setting_type = "runtime-per-user",
-    default_value = 320,
+    default_value = 280,
     minimum_value = 0,
     maximum_value = 4096,
     order = "b"
@@ -19,7 +19,7 @@ data:extend({
     type = "int-setting",
     name = "hover-circuit-signals-offset-y",
     setting_type = "runtime-per-user",
-    default_value = 420,
+    default_value = 220,
     minimum_value = 0,
     maximum_value = 4096,
     order = "c"
@@ -46,17 +46,10 @@ data:extend({
     type = "int-setting",
     name = "hover-circuit-signals-update-interval",
     setting_type = "runtime-per-user",
-    default_value = 10,
+    default_value = 12,
     minimum_value = 1,
     maximum_value = 120,
     order = "f"
-  },
-  {
-    type = "bool-setting",
-    name = "hover-circuit-signals-show-zero-empty",
-    setting_type = "runtime-per-user",
-    default_value = true,
-    order = "g"
   },
   {
     type = "bool-setting",

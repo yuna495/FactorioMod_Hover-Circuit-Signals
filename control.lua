@@ -6,12 +6,13 @@ local SETTING_OFFSET_Y = "hover-circuit-signals-offset-y"
 local SETTING_COLUMNS = "hover-circuit-signals-columns"
 local SETTING_MAX_SIGNALS = "hover-circuit-signals-max-signals"
 local SETTING_UPDATE_INTERVAL = "hover-circuit-signals-update-interval"
-local SETTING_SHOW_ZERO_EMPTY = "hover-circuit-signals-show-zero-empty"
 local SETTING_SHOW_NETWORK_ID = "hover-circuit-signals-show-network-id"
 local SETTING_COMPACT_NUMBERS = "hover-circuit-signals-compact-numbers"
 local SETTING_SEPARATE_IO = "hover-circuit-signals-separate-io"
 local SETTING_SEPARATE_WIRE_COLOR = "hover-circuit-signals-separate-wire-color"
 local SETTING_SORT_ORDER = "hover-circuit-signals-sort-order"
+
+local HOVER_STABLE_TICKS = 12
 
 local function get_storage()
   storage.players = storage.players or {}
@@ -42,6 +43,9 @@ local function get_player_data(player_index)
     players_data[player_index] = {
       toggled_off = false,
       selected_unit_number = nil,
+      pending_unit_number = nil,
+      pending_since = 0,
+      last_gui_signature = nil,
       window = nil
     }
   end
@@ -50,15 +54,13 @@ end
 
 local function get_player_settings(player)
   local s = settings.get_player_settings(player)
-  local show_zero_empty_setting = s[SETTING_SHOW_ZERO_EMPTY]
   return {
     enabled = s[SETTING_ENABLED] and s[SETTING_ENABLED].value,
-    offset_x = s[SETTING_OFFSET_X] and s[SETTING_OFFSET_X].value or 320,
-    offset_y = s[SETTING_OFFSET_Y] and s[SETTING_OFFSET_Y].value or 420,
+    offset_x = s[SETTING_OFFSET_X] and s[SETTING_OFFSET_X].value or 280,
+    offset_y = s[SETTING_OFFSET_Y] and s[SETTING_OFFSET_Y].value or 220,
     columns = s[SETTING_COLUMNS] and s[SETTING_COLUMNS].value or 5,
     max_signals = s[SETTING_MAX_SIGNALS] and s[SETTING_MAX_SIGNALS].value or 25,
     update_interval = s[SETTING_UPDATE_INTERVAL] and s[SETTING_UPDATE_INTERVAL].value or 10,
-    show_zero_empty = show_zero_empty_setting == nil and true or show_zero_empty_setting.value,
     show_network_id = s[SETTING_SHOW_NETWORK_ID] and s[SETTING_SHOW_NETWORK_ID].value,
     compact_numbers = s[SETTING_COMPACT_NUMBERS] and s[SETTING_COMPACT_NUMBERS].value,
     separate_io = s[SETTING_SEPARATE_IO] and s[SETTING_SEPARATE_IO].value,
@@ -128,11 +130,11 @@ end
 -- 回路データ収集 (Factorio 2.0 API)
 local function collect_circuit_data(entity, p_settings)
   if not valid(entity) then return nil end
-  
+
   local ok, connectors = pcall(function()
     return entity.get_wire_connectors(false)
   end)
-  
+
   if not ok or not connectors then return nil end
 
   local sections = {}
@@ -140,20 +142,22 @@ local function collect_circuit_data(entity, p_settings)
 
   for connector_id, connector in pairs(connectors) do
     if connector and connector.connection_count > 0 then
+      local network = nil
+      local ok_network, found_network = pcall(function()
+        return entity.get_circuit_network(connector_id)
+      end)
+      if ok_network then
+        network = found_network
+      end
+
       local meta = get_connector_meta(connector_id, connectors)
       local io_type = meta.io_type
       local color = meta.color
-      
-      local net_id = nil
-      local ok_net, found_net_id = pcall(function()
-        return connector.network_id or connector.circuit_network_id
-      end)
-      if ok_net and found_net_id then
-        net_id = found_net_id
-      end
+
+      local net_id = network and network.network_id or nil
 
       local sig_ok, raw_signals = pcall(function()
-        return entity.get_signals(connector_id)
+        return network and network.signals or entity.get_signals(connector_id)
       end)
 
       local signal_list = {}
@@ -177,7 +181,7 @@ local function collect_circuit_data(entity, p_settings)
       local net_str = net_id and tostring(net_id) or "0"
       local key = io_group .. "_" .. color_group .. "_" .. net_str
 
-      if not seen_keys[key] then
+      if #signal_list > 0 and not seen_keys[key] then
         seen_keys[key] = true
 
         table.insert(sections, {
@@ -233,6 +237,34 @@ local function sort_signals(signals, sort_order)
 end
 
 -- 位置計算 (Clamp付き)
+local function build_gui_signature(sections_data, p_settings, total_signals)
+  local parts = {
+    tostring(p_settings.columns),
+    tostring(p_settings.max_signals),
+    tostring(p_settings.show_network_id),
+    tostring(p_settings.compact_numbers),
+    tostring(p_settings.separate_io),
+    tostring(p_settings.separate_wire_color),
+    tostring(p_settings.sort_order),
+    tostring(total_signals)
+  }
+
+  for _, sec in ipairs(sections_data) do
+    table.insert(parts, sec.io_type or "")
+    table.insert(parts, sec.color or "")
+    table.insert(parts, tostring(sec.net_id or 0))
+
+    for _, entry in ipairs(sec.signals) do
+      table.insert(parts, entry.signal.type or "")
+      table.insert(parts, entry.signal.name or "")
+      table.insert(parts, entry.signal.quality or "")
+      table.insert(parts, tostring(entry.count or 0))
+    end
+  end
+
+  return table.concat(parts, "\31")
+end
+
 local function estimate_window_size(sections_data, p_settings, total_signals)
   local columns = math.max(1, p_settings.columns or 5)
   local max_signals = math.max(1, p_settings.max_signals or 25)
@@ -287,16 +319,37 @@ end
 local function close_window(p_data)
   safe_destroy(p_data.window)
   p_data.window = nil
+  p_data.last_gui_signature = nil
+end
+
+local function reset_hover_state(p_data)
+  close_window(p_data)
   p_data.selected_unit_number = nil
+  p_data.pending_unit_number = nil
+  p_data.pending_since = 0
+end
+
+local function schedule_hover(p_data, unit_num, tick)
+  if p_data.pending_unit_number == unit_num then
+    return
+  end
+
+  p_data.pending_unit_number = unit_num
+  p_data.pending_since = tick or game.tick
+
+  if p_data.selected_unit_number ~= unit_num then
+    p_data.selected_unit_number = nil
+    close_window(p_data)
+  end
 end
 
 -- ツールチップ構築
 local function build_signal_tooltip(entry, section, p_settings)
   local full_val = format_count_full(entry.count)
   local tooltip = { "" }
-  
+
   table.insert(tooltip, { "hover-circuit-signals.tooltip-signal-val", full_val })
-  
+
   if p_settings.show_network_id then
     local color_loc = { "hover-circuit-signals." .. section.color }
     table.insert(tooltip, "\n")
@@ -315,20 +368,30 @@ end
 -- GUI生成 / 更新
 local function refresh_gui(player, p_data, entity, p_settings)
   local sections_data = collect_circuit_data(entity, p_settings)
-  
+
   if not sections_data then
     close_window(p_data)
     return
   end
 
+  local display_sections = {}
   local total_signals = 0
   for _, sec in ipairs(sections_data) do
     sort_signals(sec.signals, p_settings.sort_order)
+    table.insert(display_sections, sec)
     total_signals = total_signals + #sec.signals
   end
 
-  if total_signals == 0 and not p_settings.show_zero_empty then
+  if #display_sections == 0 then
     close_window(p_data)
+    return
+  end
+
+  sections_data = display_sections
+  local gui_signature = build_gui_signature(sections_data, p_settings, total_signals)
+
+  if valid(p_data.window) and p_data.last_gui_signature == gui_signature then
+    update_window_position(player, p_data.window, p_settings, sections_data, total_signals)
     return
   end
 
@@ -345,6 +408,7 @@ local function refresh_gui(player, p_data, entity, p_settings)
   end
 
   local window = p_data.window
+  p_data.last_gui_signature = gui_signature
   window.clear()
 
   local displayed_count = 0
@@ -357,7 +421,7 @@ local function refresh_gui(player, p_data, entity, p_settings)
       table.insert(header_text, { "hover-circuit-signals." .. sec.io_type })
       table.insert(header_text, " ")
     end
-    
+
     if p_settings.separate_wire_color then
       table.insert(header_text, "● ")
       table.insert(header_text, { "hover-circuit-signals." .. sec.color })
@@ -386,49 +450,41 @@ local function refresh_gui(player, p_data, entity, p_settings)
     })
     inner_frame.style.padding = 4
 
-    if #sec.signals == 0 then
-      inner_frame.add({
-        type = "label",
-        caption = { "hover-circuit-signals.no-signals" },
-        style = "grey_label"
-      })
-    else
-      local table_element = inner_frame.add({
-        type = "table",
-        column_count = p_settings.columns
-      })
-      table_element.style.cell_padding = 1
+    local table_element = inner_frame.add({
+      type = "table",
+      column_count = p_settings.columns
+    })
+    table_element.style.cell_padding = 1
 
-      for _, entry in ipairs(sec.signals) do
-        local remaining_in_total = total_signals - displayed_count
-        
-        if displayed_count < p_settings.max_signals - 1 or (displayed_count == p_settings.max_signals - 1 and remaining_in_total == 1) then
-          displayed_count = displayed_count + 1
-          
-          local display_text = p_settings.compact_numbers and format_count_compact(entry.count) or format_count_full(entry.count)
-          local tooltip = build_signal_tooltip(entry, sec, p_settings)
+    for _, entry in ipairs(sec.signals) do
+      local remaining_in_total = total_signals - displayed_count
 
-          local btn = table_element.add({
-            type = "choose-elem-button",
-            elem_type = "signal",
-            style = "slot_button",
-            tooltip = tooltip
-          })
-          btn.elem_value = entry.signal
-          btn.locked = true
-          btn.style.size = 38
+      if displayed_count < p_settings.max_signals - 1 or (displayed_count == p_settings.max_signals - 1 and remaining_in_total == 1) then
+        displayed_count = displayed_count + 1
 
-          btn.add({
-            type = "label",
-            style = "count_label",
-            caption = display_text,
-            ignored_by_interaction = true,
-            tooltip = tooltip
-          })
-        else
-          overflow_count = overflow_count + 1
-          overflow_parent_table = table_element
-        end
+        local display_text = p_settings.compact_numbers and format_count_compact(entry.count) or format_count_full(entry.count)
+        local tooltip = build_signal_tooltip(entry, sec, p_settings)
+
+        local btn = table_element.add({
+          type = "choose-elem-button",
+          elem_type = "signal",
+          style = "slot_button",
+          tooltip = tooltip
+        })
+        btn.elem_value = entry.signal
+        btn.locked = true
+        btn.style.size = 38
+
+        btn.add({
+          type = "label",
+          style = "count_label",
+          caption = display_text,
+          ignored_by_interaction = true,
+          tooltip = tooltip
+        })
+      else
+        overflow_count = overflow_count + 1
+        overflow_parent_table = table_element
       end
     end
   end
@@ -458,22 +514,21 @@ local function on_tick(event)
     local p_settings = get_player_settings(player)
 
     if not p_settings.enabled or p_data.toggled_off then
-      if valid(p_data.window) then
-        close_window(p_data)
-      end
+      reset_hover_state(p_data)
     else
       local selected = player.selected
       if valid(selected) then
         local unit_num = get_entity_key(selected)
-        
-        if p_data.selected_unit_number ~= unit_num or (event.tick % p_settings.update_interval == player.index % p_settings.update_interval) then
+
+        schedule_hover(p_data, unit_num, event.tick)
+
+        if event.tick - (p_data.pending_since or event.tick) >= HOVER_STABLE_TICKS and
+          (p_data.selected_unit_number ~= unit_num or (event.tick % p_settings.update_interval == player.index % p_settings.update_interval)) then
           p_data.selected_unit_number = unit_num
           refresh_gui(player, p_data, selected, p_settings)
         end
       else
-        if valid(p_data.window) then
-          close_window(p_data)
-        end
+        reset_hover_state(p_data)
       end
     end
   end
@@ -487,17 +542,15 @@ local function on_selected_entity_changed(event)
   local p_settings = get_player_settings(player)
 
   if not p_settings.enabled or p_data.toggled_off then
-    close_window(p_data)
+    reset_hover_state(p_data)
     return
   end
 
   local selected = player.selected
   if valid(selected) then
-    local unit_num = get_entity_key(selected)
-    p_data.selected_unit_number = unit_num
-    refresh_gui(player, p_data, selected, p_settings)
+    schedule_hover(p_data, get_entity_key(selected), event.tick)
   else
-    close_window(p_data)
+    reset_hover_state(p_data)
   end
 end
 
@@ -509,7 +562,7 @@ local function on_toggle_hotkey(event)
   p_data.toggled_off = not p_data.toggled_off
 
   if p_data.toggled_off then
-    close_window(p_data)
+    reset_hover_state(p_data)
     player.create_local_flying_text({
       text = { "hover-circuit-signals.msg-disabled" },
       create_at = { player.position.x, player.position.y - 1 }
@@ -519,11 +572,14 @@ local function on_toggle_hotkey(event)
       text = { "hover-circuit-signals.msg-enabled" },
       create_at = { player.position.x, player.position.y - 1 }
     })
-    
+
     local selected = player.selected
     if valid(selected) then
       local p_settings = get_player_settings(player)
-      p_data.selected_unit_number = get_entity_key(selected)
+      local unit_num = get_entity_key(selected)
+      p_data.pending_unit_number = unit_num
+      p_data.pending_since = event.tick - HOVER_STABLE_TICKS
+      p_data.selected_unit_number = unit_num
       refresh_gui(player, p_data, selected, p_settings)
     end
   end
@@ -537,8 +593,38 @@ local function on_player_left(event)
   end
 end
 
+local function on_runtime_mod_setting_changed(event)
+  local prefix = "hover-circuit-signals"
+  if event.setting ~= nil and string.sub(event.setting, 1, string.len(prefix)) ~= prefix then
+    return
+  end
+
+  local player = game.get_player(event.player_index)
+  if not valid(player) then return end
+
+  local p_data = get_player_data(player.index)
+  local p_settings = get_player_settings(player)
+
+  if not p_settings.enabled or p_data.toggled_off then
+    reset_hover_state(p_data)
+    return
+  end
+
+  local selected = player.selected
+  if valid(selected) then
+    local unit_num = get_entity_key(selected)
+    p_data.pending_unit_number = unit_num
+    p_data.pending_since = event.tick - HOVER_STABLE_TICKS
+    p_data.selected_unit_number = unit_num
+    refresh_gui(player, p_data, selected, p_settings)
+  else
+    reset_hover_state(p_data)
+  end
+end
+
 script.on_event(defines.events.on_tick, on_tick)
 script.on_event(defines.events.on_selected_entity_changed, on_selected_entity_changed)
+script.on_event(defines.events.on_runtime_mod_setting_changed, on_runtime_mod_setting_changed)
 script.on_event("hover-circuit-signals-toggle", on_toggle_hotkey)
 script.on_event(defines.events.on_player_left_game, on_player_left)
 script.on_event(defines.events.on_player_removed, on_player_left)
