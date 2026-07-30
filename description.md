@@ -8,14 +8,14 @@ You can configure the window position, number of columns, maximum displayed sign
 
 Press `Alt + C` to toggle the hover display for your player.
 
-Compatibility:
+## Compatibility
 
 - Factorio 2.0
 - Space Age is not required
 - Single-player and multiplayer
 - Modded entities are supported only when their circuit connectors and signals are available through the standard Factorio runtime API
 
-Limitations:
+## Limitations
 
 - Zero-valued signals are normally not present in circuit signal lists, so they are not displayed.
 - Entity ghosts and ghost wires are not guaranteed to show live signals.
