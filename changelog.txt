@@ -1,0 +1,15 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 30. 07. 2026
+  Features:
+    - Initial public release for Factorio 2.0.
+    - Shows live non-zero circuit signals when hovering over a circuit-connected entity.
+    - Supports red and green wires, combinator input/output connectors, circuit network IDs, sorting, compact number labels, and per-player runtime settings.
+    - Added Alt + C per-player display toggle.
+  Optimizations:
+    - Reuses existing GUI elements when only signal values change.
+    - Spreads per-player refresh ticks according to the configured update interval.
+  Bugfixes:
+    - Merges signals correctly when input/output or red/green separation is disabled.
+    - Shows a +N overflow tile without creating empty signal sections.
+    - Preserves the hotkey disabled state when a player leaves and rejoins.

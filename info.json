@@ -1,8 +1,10 @@
 {
   "name": "Hover-Circuit-Signals",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "title": "Hover Circuit Signals",
   "author": "yuna495",
   "factorio_version": "2.0",
-  "dependencies": []
+  "dependencies": [],
+  "description": "Displays live circuit network signals in a compact window when hovering over a connected entity. Supports red and green wires, combinator input/output terminals, network IDs, sorting, and per-player display settings.",
+  "homepage": "https://github.com/yuna495/FactorioMod_Hover-Circuit-Signals"
 }
