@@ -13,6 +13,7 @@ local SETTING_SEPARATE_WIRE_COLOR = "hover-circuit-signals-separate-wire-color"
 local SETTING_SORT_ORDER = "hover-circuit-signals-sort-order"
 
 local HOVER_STABLE_TICKS = 12
+local TRANSIENT_SIGNAL_LOSS_REFRESHES = 3
 local KEY_SEPARATOR = "\31"
 
 local IO_ORDER = {
@@ -102,6 +103,7 @@ local function clear_gui_refs(p_data)
   p_data.window = nil
   p_data.gui_refs = nil
   p_data.last_gui_signature = nil
+  p_data.empty_refresh_count = 0
 end
 
 local function close_window(p_data, player)
@@ -140,6 +142,7 @@ local function get_player_data(player_index)
   p_data.pending_since = p_data.pending_since or 0
   p_data.next_refresh_tick = p_data.next_refresh_tick
   p_data.last_gui_signature = p_data.last_gui_signature
+  p_data.empty_refresh_count = p_data.empty_refresh_count or 0
   p_data.window = p_data.window
   p_data.gui_refs = p_data.gui_refs
 
@@ -260,23 +263,23 @@ local function get_connector_meta(connector_id)
 end
 
 local function get_real_connection_count(connector)
-  if not valid(connector) then return 0 end
+  if not valid(connector) then return 0, false end
 
   local ok_real, real_count = pcall(function()
     return connector.real_connection_count
   end)
   if ok_real and real_count then
-    return real_count
+    return real_count, false
   end
 
   local ok_count, connection_count = pcall(function()
     return connector.connection_count
   end)
   if ok_count and connection_count then
-    return connection_count
+    return connection_count, false
   end
 
-  return 0
+  return 0, not ok_real or not ok_count
 end
 
 local function get_network(entity, connector_id)
@@ -320,10 +323,10 @@ local function read_signals(entity, connector_id, network)
   end)
 
   if ok_signals then
-    return raw_signals
+    return raw_signals, false
   end
 
-  return nil
+  return nil, true
 end
 
 local function add_source(target, source)
@@ -365,72 +368,84 @@ local function collect_circuit_data(entity, p_settings)
   local sections_by_key = {}
   local seen_sources = {}
   local has_connected_circuit = false
+  local transient_failure = false
 
   for connector_id, connector in pairs(connectors) do
     local meta = get_connector_meta(connector_id)
 
-    if meta and valid(connector) and get_real_connection_count(connector) > 0 then
-      has_connected_circuit = true
+    if meta and valid(connector) then
+      local connection_count, count_failed = get_real_connection_count(connector)
+      if count_failed then
+        transient_failure = true
+      end
 
-      local network = get_network(entity, connector_id)
-      local net_id = get_network_id(network, connector)
-      local source = {
-        io_type = meta.io_type,
-        color = meta.color,
-        net_id = net_id
-      }
-      source.key = source_key(source)
+      if connection_count > 0 then
+        has_connected_circuit = true
 
-      if not seen_sources[source.key] then
-        seen_sources[source.key] = true
+        local network = get_network(entity, connector_id)
+        local net_id = get_network_id(network, connector)
+        local source = {
+          io_type = meta.io_type,
+          color = meta.color,
+          net_id = net_id
+        }
+        source.key = source_key(source)
 
-        local raw_signals = read_signals(entity, connector_id, network)
-        if raw_signals then
-          local section_key = section_key_for_source(source, p_settings)
-          local section = sections_by_key[section_key]
+        if not seen_sources[source.key] then
+          seen_sources[source.key] = true
 
-          if not section then
-            section = {
-              key = section_key,
-              io_type = p_settings.separate_io and source.io_type or "all",
-              color = p_settings.separate_wire_color and source.color or "all",
-              signals = {},
-              signals_by_key = {},
-              sources = {},
-              source_map = {}
-            }
-            sections_by_key[section_key] = section
-            table.insert(sections, section)
+          local raw_signals, signals_failed = read_signals(entity, connector_id, network)
+          if signals_failed then
+            transient_failure = true
           end
 
-          local source_added_to_section = false
+          if raw_signals then
+            local section_key = section_key_for_source(source, p_settings)
+            local section = sections_by_key[section_key]
 
-          for _, raw_signal in pairs(raw_signals) do
-            local signal = normalize_signal_id(raw_signal.signal)
-            local count = raw_signal.count or 0
+            if not section then
+              section = {
+                key = section_key,
+                io_type = p_settings.separate_io and source.io_type or "all",
+                color = p_settings.separate_wire_color and source.color or "all",
+                signals = {},
+                signals_by_key = {},
+                sources = {},
+                source_map = {}
+              }
+              sections_by_key[section_key] = section
+              table.insert(sections, section)
+            end
 
-            if signal and count ~= 0 then
-              local key = signal_key(signal)
-              local entry = section.signals_by_key[key]
+            local source_added_to_section = false
 
-              if not entry then
-                entry = {
-                  key = key,
-                  signal = signal,
-                  count = 0,
-                  sources = {},
-                  source_map = {}
-                }
-                section.signals_by_key[key] = entry
-                table.insert(section.signals, entry)
-              end
+            for _, raw_signal in pairs(raw_signals) do
+              local signal = normalize_signal_id(raw_signal.signal)
+              local count = raw_signal.count or 0
 
-              entry.count = entry.count + count
-              add_source(entry, source)
+              if signal and count ~= 0 then
+                local key = signal_key(signal)
+                local entry = section.signals_by_key[key]
 
-              if not source_added_to_section then
-                add_source(section, source)
-                source_added_to_section = true
+                if not entry then
+                  entry = {
+                    key = key,
+                    signal = signal,
+                    count = 0,
+                    sources = {},
+                    source_map = {}
+                  }
+                  section.signals_by_key[key] = entry
+                  table.insert(section.signals, entry)
+                end
+
+                entry.count = entry.count + count
+                add_source(entry, source)
+
+                if not source_added_to_section then
+                  add_source(section, source)
+                  source_added_to_section = true
+                end
               end
             end
           end
@@ -471,7 +486,7 @@ local function collect_circuit_data(entity, p_settings)
   end
 
   if #display_sections == 0 then
-    return nil, has_connected_circuit
+    return nil, has_connected_circuit, transient_failure
   end
 
   table.sort(display_sections, function(a, b)
@@ -488,7 +503,7 @@ local function collect_circuit_data(entity, p_settings)
     return net_a < net_b
   end)
 
-  return display_sections, has_connected_circuit
+  return display_sections, has_connected_circuit, transient_failure
 end
 
 local function compare_signal_identity(a, b)
@@ -912,12 +927,21 @@ local function rebuild_gui(player, p_data, p_settings, display_plan, gui_signatu
 end
 
 local function refresh_gui(player, p_data, entity, p_settings)
-  local sections_data, has_connected_circuit = collect_circuit_data(entity, p_settings)
+  local sections_data, has_connected_circuit, transient_failure = collect_circuit_data(entity, p_settings)
 
   if not sections_data then
+    if transient_failure and has_connected_circuit and valid(p_data.window) then
+      p_data.empty_refresh_count = (p_data.empty_refresh_count or 0) + 1
+      if p_data.empty_refresh_count < TRANSIENT_SIGNAL_LOSS_REFRESHES then
+        return true, has_connected_circuit
+      end
+    end
+
     close_window(p_data, player)
     return false, has_connected_circuit
   end
+
+  p_data.empty_refresh_count = 0
 
   local display_plan = prepare_display_plan(sections_data, p_settings)
   local gui_signature = build_gui_signature(display_plan.all_sections, p_settings)
